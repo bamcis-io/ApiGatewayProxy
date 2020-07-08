@@ -1,0 +1,968 @@
+{
+	"AWSTemplateFormatVersion" : "2010-09-09",
+	"Transform" : "AWS::Serverless-2016-10-31",
+	"Description" : "A serverless endpoint solution to inspect SigV4 authentication and forward traffic.",
+
+	"Parameters" : {
+		"OrgId" : {
+			"Description" : "The organization id you want to restrict access to.",
+			"Type" : "String"
+		},
+
+		"NotificationEmail"  : {
+            "Description" : "The email address notifications will be sent to when processing errors occur.",
+            "Type"        : "String"
+        },
+
+		"LogRetentionInDays" : {
+            "Type" : "Number",
+            "Description" : "The number of days to retain the CloudWatch Logs for the function. If this is set to 0, it will be infinite retention.",
+            "MinValue"    : 0,
+            "Default"     : 7
+        },
+
+		"CertificateArn" : {
+			"Description" : "The ARN to the ACM cert used for the custom domain name.",
+			"Type" : "String"
+		},
+		"CustomDomainName" : {
+			"Description" : "The FQDN to use for the proxy endpoint.",
+			"Type" : "String"
+		}
+	},
+
+	"Conditions" : {
+		"InfiniteRetention" : {
+            "Fn::Equals" : [
+                {
+                    "Ref" : "LogRetentionInDays"
+                },
+                0
+            ]
+        }	
+	},
+
+	"Resources" : {
+		"SNSTopic" : {
+            "Type" : "AWS::SNS::Topic",
+            "Properties" : {
+                "DisplayName" : "Lambda Proxy Notifications",
+                "Subscription" : [
+                    {
+                        "Protocol" : "email",
+                        "Endpoint" : {
+                            "Ref" : "NotificationEmail"
+                        }
+                    }
+                ],
+                "TopicName"    : "Proxy_Lambda_Notifications"
+            }
+        },
+
+		"ProxyDeadLetterQueue" : {
+			"Type" : "AWS::SQS::Queue",
+			"Properties" : {
+			}
+		},
+		"ProxyDeadLetterQueueDepthAlarm": {
+			"Type": "AWS::CloudWatch::Alarm",
+			"Properties": {
+				"AlarmDescription": "Alarm if the proxy DLQ depth grows beyond 1 message in a 5 minute span.",
+				"Namespace": "AWS/SQS",
+				"MetricName": "ApproximateNumberOfMessagesVisible",
+				"Dimensions": [
+					{
+						"Name": "QueueName",
+						"Value" : { "Fn::GetAtt" : ["ProxyDeadLetterQueue", "QueueName"] }
+					}
+				],
+				"Statistic": "Sum",
+				"Period": "300",
+				"EvaluationPeriods": "1",
+				"Threshold": "1",
+				"ComparisonOperator": "GreaterThanOrEqualToThreshold",
+				"AlarmActions": [
+					{
+						"Ref": "SNSTopic"
+					}
+				]
+			}
+		},
+
+		"LambdaProxyLogGroup"  : {
+            "Type" : "AWS::Logs::LogGroup",
+            "Properties" : {
+                "LogGroupName" : {
+						"Fn::Sub" : "/aws/lambda/${ProxyLambda}"
+					},
+					"RetentionInDays" : {
+                    "Fn::If" : [
+                        "InfiniteRetention",
+                        {
+                            "Ref" : "AWS::NoValue"
+                        },
+                        {
+                            "Ref" : "LogRetentionInDays"
+                        }
+                    ]
+                }
+            }
+        },
+		"LambdaAuthorizerLogGroup"  : {
+            "Type" : "AWS::Logs::LogGroup",
+            "Properties" : {
+                "LogGroupName" : {
+						"Fn::Sub" : "/aws/lambda/${AuthorizerLambda}"
+					},
+					"RetentionInDays" : {
+                    "Fn::If" : [
+                        "InfiniteRetention",
+                        {
+                            "Ref" : "AWS::NoValue"
+                        },
+                        {
+                            "Ref" : "LogRetentionInDays"
+                        }
+                    ]
+                }
+            }
+        },
+
+		"ApiGatewayProxyLogGroup"  : {
+            "Type" : "AWS::Logs::LogGroup",
+            "Properties" : {
+                "LogGroupName" : {
+						"Fn::Sub" : "API-Gateway-Execution-Logs_${ProxyApi}/proxy"
+					},
+					"RetentionInDays" : {
+                    "Fn::If" : [
+                        "InfiniteRetention",
+                        {
+                            "Ref" : "AWS::NoValue"
+                        },
+                        {
+                            "Ref" : "LogRetentionInDays"
+                        }
+                    ]
+                }
+            }
+        },
+
+		"LambdaProxyIAMRole" : {
+			"Type" : "AWS::IAM::Role",
+			"Properties" : {
+				"Path" : "/proxy/",
+				"AssumeRolePolicyDocument" : {
+					"Version" : "2012-10-17",
+					"Statement" : [
+						{
+							"Effect" : "Allow",
+							"Principal" : {
+								"Service" : [
+									"lambda.amazonaws.com"
+								]
+							},
+							"Action" : [
+								"sts:AssumeRole"
+							]
+						}
+					]
+				}
+			}
+		},
+		"LambdaProxyXRayWriteOnlyPolicy" : {
+			"Type" : "AWS::IAM::ManagedPolicy",
+			"Properties" : {
+				"Path" : "/proxy/",
+				"PolicyDocument" : {
+					"Version": "2012-10-17",
+					"Statement": [
+						{
+							"Effect": "Allow",
+							"Action": [
+								"xray:PutTraceSegments",
+								"xray:PutTelemetryRecords",
+								"xray:GetSamplingRules",
+								"xray:GetSamplingTargets",
+								"xray:GetSamplingStatisticSummaries"
+							],
+							"Resource": [
+								"*"
+							]
+						}
+					]
+				},
+				"Roles" : [
+					{
+						"Ref" : "LambdaProxyIAMRole"
+					}
+				]
+			}
+		},
+		"LambdaProxySNSPolicy"     : {
+            "Type" : "AWS::IAM::ManagedPolicy",
+            "Properties" : {
+                "Path" : "/proxy/",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "sns:Publish"
+                            ],
+                            "Resource" : [
+                                {
+                                    "Ref" : "SNSTopic"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+						"Ref" : "LambdaProxyIAMRole"
+					}
+                ]
+            }
+        },
+		"LambdaProxyCWLPolicy"     : {
+            "Type" : "AWS::IAM::ManagedPolicy",
+            "Properties" : {
+                "Path" : "/proxy/",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "logs:CreateLogStream",
+                                "logs:DescribeLogStreams"
+                            ],
+                            "Resource" : {
+                                "Fn::Sub" : "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LambdaProxyLogGroup}:*"
+                            }
+                        },
+						{
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "logs:PutLogEvents",
+								"logs:GetLogEvents",
+								"logs:FilterLogEvents"
+                            ],
+                            "Resource" : {
+                                "Fn::Sub" : "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LambdaProxyLogGroup}:log-stream:*"
+                            }
+                        },
+						{
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "logs:DescribeLogGroups"
+                            ],
+                            "Resource" : {
+                                "Fn::Sub" : "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+                            }
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "LambdaProxyIAMRole"
+                    }
+                ]
+            }
+        },
+		"LambdaProxySTSPolicy"     : {
+            "Type" : "AWS::IAM::ManagedPolicy",
+            "Properties" : {
+                "Path" : "/proxy/",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "sts:GetAccessKeyInfo"
+                            ],
+                            "Resource" : "*"
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "LambdaProxyIAMRole"
+                    }
+                ]
+            }
+        },
+		"LambdaProxySQSPolicy"     : {
+            "Type" : "AWS::IAM::ManagedPolicy",
+            "Properties" : {
+                "Path" : "/proxy/",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "sqs:SendMessage"
+                            ],
+                            "Resource" : [
+                                {
+                                    "Fn::GetAtt" : [ "ProxyDeadLetterQueue", "Arn" ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "LambdaProxyIAMRole"
+                    }
+                ]
+            }
+        },
+
+		"LambdaAuthorizerIAMRole" : {
+			"Type" : "AWS::IAM::Role",
+			"Properties" : {
+				"Path" : "/proxy/",
+				"AssumeRolePolicyDocument" : {
+					"Version" : "2012-10-17",
+					"Statement" : [
+						{
+							"Effect" : "Allow",
+							"Principal" : {
+								"Service" : [
+									"lambda.amazonaws.com"
+								]
+							},
+							"Action" : [
+								"sts:AssumeRole"
+							]
+						}
+					]
+				}
+			}
+		},
+		"LambdaAuthorizerXRayWriteOnlyPolicy" : {
+			"Type" : "AWS::IAM::ManagedPolicy",
+			"Properties" : {
+				"Path" : "/proxy/",
+				"PolicyDocument" : {
+					"Version": "2012-10-17",
+					"Statement": [
+						{
+							"Effect": "Allow",
+							"Action": [
+								"xray:PutTraceSegments",
+								"xray:PutTelemetryRecords",
+								"xray:GetSamplingRules",
+								"xray:GetSamplingTargets",
+								"xray:GetSamplingStatisticSummaries"
+							],
+							"Resource": [
+								"*"
+							]
+						}
+					]
+				},
+				"Roles" : [
+					{
+						"Ref" : "LambdaAuthorizerIAMRole"
+					}
+				]
+			}
+		},
+		"LambdaAuthorizerSNSPolicy"     : {
+            "Type" : "AWS::IAM::ManagedPolicy",
+            "Properties" : {
+                "Path" : "/proxy/",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "sns:Publish"
+                            ],
+                            "Resource" : [
+                                {
+                                    "Ref" : "SNSTopic"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+						"Ref" : "LambdaAuthorizerIAMRole"
+					}
+                ]
+            }
+        },
+		"LambdaAuthorizerCWLPolicy"     : {
+            "Type" : "AWS::IAM::ManagedPolicy",
+            "Properties" : {
+                "Path" : "/proxy/",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "logs:CreateLogStream",
+                                "logs:DescribeLogStreams"
+                            ],
+                            "Resource" : {
+                                "Fn::Sub" : "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LambdaAuthorizerLogGroup}:*"
+                            }
+                        },
+						{
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "logs:PutLogEvents",
+								"logs:GetLogEvents",
+								"logs:FilterLogEvents"
+                            ],
+                            "Resource" : [
+							    {
+                                    "Fn::Sub" : "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LambdaAuthorizerLogGroup}:log-stream:*"
+                                }
+							]
+                        },
+						{
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "logs:DescribeLogGroups"
+                            ],
+                            "Resource" : {
+                                "Fn::Sub" : "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+                            }
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "LambdaAuthorizerIAMRole"
+                    }
+                ]
+            }
+        },
+		"LambdaAuthorizerSTSPolicy"     : {
+            "Type" : "AWS::IAM::ManagedPolicy",
+            "Properties" : {
+                "Path" : "/proxy/",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "sts:GetAccessKeyInfo"
+                            ],
+                            "Resource" : "*"
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "LambdaAuthorizerIAMRole"
+                    }
+                ]
+            }
+        },
+		"LambdaAuthorizerSQSPolicy"     : {
+            "Type" : "AWS::IAM::ManagedPolicy",
+            "Properties" : {
+                "Path" : "/proxy/",
+                "PolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Action" : [
+                                "sqs:SendMessage"
+                            ],
+                            "Resource" : [
+                                {
+                                    "Fn::GetAtt" : [ "ProxyDeadLetterQueue", "Arn" ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Roles"          : [
+                    {
+                        "Ref" : "LambdaAuthorizerIAMRole"
+                    }
+                ]
+            }
+        },
+
+		"ProxyLambda" : {
+			"Type" : "AWS::Serverless::Function",
+			"Properties" : {
+				"CodeUri" : "",
+				"Description" : "Processes all AWS requests as a proxy",
+				"Environment" : {
+					"Variables" : {
+						"ORG_ID" : {
+							"Ref" : "OrgId"
+						}						
+					}
+				},
+				"DeadLetterQueue" : {
+					"Type" : "SQS",
+					"TargetArn" : {
+						"Fn::GetAtt" : [ "ProxyDeadLetterQueue", "Arn" ]
+					}
+				},
+				"Handler" : "ApiGatewayProxy::BAMCIS.ApiGatewayProxy.Entrypoint::Execute",
+				"MemorySize" : 1024,
+				"Role" : {
+					"Fn::GetAtt" : [ "LambdaProxyIAMRole", "Arn" ]
+				},
+				"Runtime" : "dotnetcore2.1",
+				"Timeout" : 300,
+				"Tracing" : "Active"				 
+			},
+			"DependsOn" : [
+				"LambdaProxyXRayWriteOnlyPolicy",
+				"LambdaProxySQSPolicy"
+			]
+		},
+		"LambdaInvokePolicyRoot" : {
+			"Type" : "AWS::Lambda::Permission",
+			"Properties" : {
+				"Action" : "lambda:InvokeFunction",
+				"FunctionName" : {
+					"Fn::GetAtt" : [ "ProxyLambda", "Arn" ]
+				},
+				"Principal" : "apigateway.amazonaws.com",
+				"SourceArn" : {
+					"Fn::Sub" : "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ProxyApi}/*/*/"
+				}
+			}
+		},
+		"LambdaInvokePolicyPath" : {
+			"Type" : "AWS::Lambda::Permission",
+			"Properties" : {
+				"Action" : "lambda:InvokeFunction",
+				"FunctionName" : {
+					"Fn::GetAtt" : [ "ProxyLambda", "Arn" ]
+				},
+				"Principal" : "apigateway.amazonaws.com",
+				"SourceArn" : {
+					"Fn::Sub" : "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ProxyApi}/*/*/*"
+				}
+			}
+		},
+
+		"AuthorizerLambda" : {
+			"Type" : "AWS::Serverless::Function",
+			"Properties" : {
+				"CodeUri" : "",
+				"Description" : "Because the proxy lambda integration strips the SigV4 header, believing it to be submitted by an AWS user that needs to do auth, this reads that header value and includes it as context to the main function so it can be evaluated.",
+				"Environment" : {
+					"Variables" : {
+						"ORG_ID" : {
+							"Ref" : "OrgId"
+						}						
+					}
+				},
+				"DeadLetterQueue" : {
+					"Type" : "SQS",
+					"TargetArn" : {
+						"Fn::GetAtt" : [ "ProxyDeadLetterQueue", "Arn" ]
+					}
+				},
+				"Handler" : "ApiGatewayProxy::BAMCIS.ApiGatewayProxy.Entrypoint::Authorize",
+				"MemorySize" : 1024,
+				"Role" : {
+					"Fn::GetAtt" : [ "LambdaAuthorizerIAMRole", "Arn" ]
+				},
+				"Runtime" : "dotnetcore2.1",
+				"Timeout" : 300,
+				"Tracing" : "Active"				 
+			},
+			"DependsOn" : [
+				"LambdaAuthorizerXRayWriteOnlyPolicy",
+				"LambdaAuthorizerSQSPolicy"
+			]
+		},
+		"AuthorizerLambdaInvokePolicy" : {
+			"Type" : "AWS::Lambda::Permission",
+			"Properties" : {
+				"Action" : "lambda:InvokeFunction",
+				"FunctionName" : {
+					"Fn::GetAtt" : [ "AuthorizerLambda", "Arn" ]
+				},
+				"Principal" : "apigateway.amazonaws.com",
+				"SourceArn" : {
+					"Fn::Sub" : "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ProxyApi}/authorizers/*"
+				}
+			}
+		},
+
+		"ApiGatewayIAMRole" : {
+            "Type" : "AWS::IAM::Role",
+            "Properties" : {
+				"Path" : "/proxy/",
+                "AssumeRolePolicyDocument" : {
+                    "Version" : "2012-10-17",
+                    "Statement" : [
+                        {
+                            "Effect" : "Allow",
+                            "Principal" : {
+                                "Service" : [
+                                    "apigateway.amazonaws.com"
+                                ]
+                            },
+                            "Action"    : [
+                                "sts:AssumeRole"
+                            ]
+                        }
+                    ]
+                }
+            }
+        },
+		"ApiGatewayProxyCWLPolicy"     : {
+            "Type" : "AWS::IAM::ManagedPolicy",
+            "Properties" : {
+                "Path" : "/proxy/",
+                "PolicyDocument" : {
+					"Version": "2012-10-17",
+					"Statement": [
+						{
+							"Effect": "Allow",
+							"Action": [
+								"logs:CreateLogGroup",
+								"logs:CreateLogStream",
+								"logs:DescribeLogGroups",
+								"logs:DescribeLogStreams",
+								"logs:PutLogEvents",
+								"logs:GetLogEvents",
+								"logs:FilterLogEvents"
+							],
+							"Resource": "*"
+						}
+					]
+				},
+                "Roles"          : [
+                    {
+                        "Ref" : "ApiGatewayIAMRole"
+                    }
+                ]
+            }
+        },
+
+		"ProxyApiAccount" : {
+			"Type" : "AWS::ApiGateway::Account",
+			"Properties" : {
+				"CloudWatchRoleArn" : {
+					"Fn::GetAtt" : [ "ApiGatewayIAMRole", "Arn" ]
+				}
+			},
+			"DependsOn" : [
+				"ProxyApi",
+				"ApiGatewayProxyCWLPolicy"
+			]
+		},
+
+		"ProxyApi" : {
+            "Type" : "AWS::ApiGateway::RestApi",
+            "Properties" : {
+			    "ApiKeySourceType" : "AUTHORIZER",
+                "Body" : {
+				  "openapi": "3.0.1",
+				  "info": {
+					"title": "proxy",
+					"version": "1.0"
+				  },				  
+				  "paths": {
+				    "/": {
+                      "options": {
+                        "consumes": [
+                          "application/json"
+                        ],
+                        "produces": [
+                          "application/json"
+                        ],
+                        "responses": {
+                          "200": {
+                            "description": "200 response",
+                            "schema": {
+                              "$ref": "#/definitions/Empty"
+                            }
+                          }
+                        },
+                        "x-amazon-apigateway-integration": {
+                          "responses": {
+                          "default": {
+                            "statusCode": "200"
+                          }
+                        },
+                        "requestTemplates": {
+                          "application/json": "{\"statusCode\": 200}"
+                        },
+                        "passthroughBehavior": "when_no_match",
+                        "type": "mock"
+                      }
+                    },
+                      "x-amazon-apigateway-any-method": {
+                        "produces": [
+                          "application/json"
+                        ],
+                        "parameters": [
+                          {
+                            "name": "Authorization",
+                            "in": "header",
+                            "required": true,
+                            "type": "string"
+                          }
+                        ],
+						"security" : [
+						  {
+						      "DefaultLambdaAuthorizer" : []
+						  }
+						],
+                        "responses": {
+                          "200": {
+                            "description": "200 response",
+                            "schema": {
+                              "$ref": "#/definitions/Empty"
+                            }
+                          }
+                        },
+                        "x-amazon-apigateway-integration": {
+                          "uri": {
+						      "Fn::Sub" : "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProxyLambda.Arn}/invocations"
+						  },
+                          "responses": {
+                            "default": {
+                              "statusCode": "200"
+                            }
+                          },
+                          "passthroughBehavior": "when_no_match",
+                          "httpMethod": "POST",
+                          "contentHandling": "CONVERT_TO_TEXT",
+                          "type": "aws_proxy"
+                        }
+                      }
+					},
+					"/{proxy+}": {
+					  "options": {
+						"responses": {
+						  "200": {
+							"description": "200 response",
+							"headers": {
+							  "Access-Control-Allow-Origin": {
+								"schema": {
+								  "type": "string"
+								}
+							  },
+							  "Access-Control-Allow-Methods": {
+								"schema": {
+								  "type": "string"
+								}
+							  },
+							  "Access-Control-Allow-Headers": {
+								"schema": {
+								  "type": "string"
+								}
+							  }
+							},
+							"content": {
+							  "application/json": {
+								"schema": {
+								  "$ref": "#/components/schemas/Empty"
+								}
+							  }
+							}
+						  }
+						},
+						"x-amazon-apigateway-integration": {
+						  "responses": {
+							"default": {
+							  "statusCode": "200",
+							  "responseParameters": {
+								"method.response.header.Access-Control-Allow-Methods": "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'",
+								"method.response.header.Access-Control-Allow-Headers": "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'",
+								"method.response.header.Access-Control-Allow-Origin": "'*'"
+							  }
+							}
+						  },
+						  "requestTemplates": {
+							"application/json": "{\"statusCode\": 200}"
+						  },
+						  "passthroughBehavior": "when_no_match",
+						  "type": "mock"
+						}
+					  },
+					  "x-amazon-apigateway-any-method": {
+						"parameters": [
+						  {
+							"name": "proxy",
+							"in": "path",
+							"required": true,
+							"schema": {
+							  "type": "string"
+							}
+						  },
+						  {
+							"name": "Authorization",
+							"in": "header",
+							"required" : true,
+							"schema": {
+							  "type": "string"
+							}
+						  }
+						],
+						"security" : [
+						  {
+						      "DefaultLambdaAuthorizer" : []
+						  }
+						],
+						"x-amazon-apigateway-integration": {
+						  "uri": {
+							"Fn::Sub" : "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProxyLambda.Arn}/invocations"
+					      },
+						  "responses": {
+							"default": {
+							  "statusCode": "200"
+							}
+						  },
+						  "passthroughBehavior": "when_no_match",
+						  "httpMethod": "POST",
+						  "cacheKeyParameters": [
+							"method.request.path.proxy"
+						  ],
+						  "contentHandling": "CONVERT_TO_TEXT",
+						  "type": "aws_proxy"
+						}
+					  }
+					}
+				  },
+				  "components": {
+					"schemas": {
+					  "Empty": {
+						"title": "Empty Schema",
+						"type": "object"
+					  }
+					},
+					"securitySchemes": {
+                      "DefaultLambdaAuthorizer": {
+                        "type": "apiKey",
+                        "name": "Authorization",
+                        "in": "header",
+                        "x-amazon-apigateway-authtype": "custom",
+                        "x-amazon-apigateway-authorizer": {
+                          "authorizerUri": {
+						    "Fn::Sub" : "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerLambda.Arn}/invocations"
+						  },
+                          "authorizerResultTtlInSeconds": 300,
+                          "type": "token"
+                        }
+                      }
+                    }
+				  }
+				},
+				"EndpointConfiguration" : {
+					"Types" : [
+						"PRIVATE"
+					],
+					"VpcEndpointIds" : [
+					    "vpce-0d1a4874b753f82ac"
+					]
+				},
+				"Policy" : {
+				    "Version" : "2012-10-17",
+					"Statement" : [
+					     {
+						     "Effect" : "Allow",
+							 "Action" : "execute-api:Invoke",
+							 "Resource" : "*",
+							 "Principal" : "*"
+						 }
+					]
+				}
+            }
+        },
+
+		"ApiGatewayStage" : {
+			"Type" : "AWS::ApiGateway::Stage",
+			"Properties" : {
+				"StageName" : "proxy",
+				"RestApiId" : {
+                    "Ref" : "ProxyApi"
+                },
+				"MethodSettings" : [
+					{
+						"LoggingLevel" : "INFO",
+						"DataTraceEnabled" : true,
+						"ResourcePath" : "/*",
+						"HttpMethod" : "*"
+					}
+				],
+				"DeploymentId" : {
+					"Ref" : "ApiGatewayDeployment"
+				}
+			}
+		},
+
+        "ApiGatewayDeployment" : {
+            "Type" : "AWS::ApiGateway::Deployment",
+            "Properties" : {
+                "RestApiId" : {
+                    "Ref" : "ProxyApi"
+                },
+                "Description" : "Proxy Endpoint Deployment"				 
+            }
+        },
+
+		"CustomDomain" : {
+			"Type" : "AWS::ApiGateway::DomainName",
+			"Properties" : {
+				"CertificateArn" : {
+					"Ref" : "CertificateArn"
+				},
+				"DomainName" : {
+					"Ref" : "CustomDomainName"
+				},
+				"EndpointConfiguration" : {
+					"Types" : [
+						"EDGE"
+					]
+				},
+				"SecurityPolicy" : "TLS_1_2"				 
+			}
+		},
+
+		"CustomDomainBasePathMapping" : {
+			"Type" : "AWS::ApiGateway::BasePathMapping",
+			"Properties" : {
+				"DomainName" : {
+					"Ref" : "CustomDomain"
+				},
+				"RestApiId" : {
+					"Ref" : "ProxyApi"
+				},
+				"Stage" : {
+					"Ref" : "ApiGatewayStage"
+				}
+			}
+		}
+	},
+
+	"Outputs" : {
+		"NativeApiUrl" : {
+			"Description" : "API endpoint URL for Prod environment",
+			"Value" : { "Fn::Sub" : "https://${ProxyApi}.execute-api.${AWS::Region}.amazonaws.com/proxy/" }
+		},
+		"ProxyApiUrl" : {
+			"Description" : "Proxy endpoint",
+			"Value" : { "Fn::Sub" : "https://${CustomDomainName}" }
+		}
+	}
+}
