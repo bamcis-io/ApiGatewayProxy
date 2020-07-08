@@ -84,6 +84,7 @@ namespace BAMCIS.ApiGatewayProxy
 
             IEnumerable<string> authHeaderParts = authHeader.Split(",").Select(x => x.Trim());
 
+            // Make sure there are at least two parts without counting
             if (!authHeaderParts.Any() || !authHeaderParts.Skip(1).Any())
             {
                 return new APIGatewayProxyResponse
